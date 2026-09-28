@@ -214,4 +214,5 @@ kafka_sink         | 44500      | 44500      | 0          | 0          | 61ns   
 
 - [API 完整清单与 Options 配置项](references/api_reference.md)
 - [典型业务场景处理器设计范式](references/processor_patterns.md)
+- [AirMQ 核心算法与数据结构深度解析 (ART/Slab/Lock-Free)](../../docs/algorithms_and_data_structures.md)
 - [端到端物联网性能评测源码](../../examples/05_iot_scenarios_bench/main.go)
