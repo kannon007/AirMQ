@@ -289,7 +289,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			qos := (flags >> 1) & 0x03
 			retain := (flags & 0x01) != 0
 
-			if qos == protocol.QoS0 && !retain && !s.hookMgr.HasPublishHooks() && s.clusterRouter == nil {
+			if qos == protocol.QoS0 && !retain && !s.hookMgr.HasPublishHooks() && s.clusterRouter == nil && ctx.ProtocolLevel != protocol.V50 {
 				remLen, varByteLen, err := protocol.DecodeRemainingLength(buf[offset+1:])
 				if err == nil && varByteLen > 0 {
 					totalLen := 1 + varByteLen + remLen
@@ -667,8 +667,10 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 		return
 	}
 
-	var qos0Bytes []byte
-	var qos0Encoded bool
+	var qos0BytesV3 []byte
+	var qos0V3Encoded bool
+	var qos0BytesV5 []byte
+	var qos0V5Encoded bool
 
 	for _, sub := range subscribers {
 		// MQTT 5.0 NoLocal: sender should not receive own message
@@ -712,21 +714,38 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 			retainFlag = p.Retain
 		}
 
+		clientProto := protocol.V311
+		if entry.ctx != nil && entry.ctx.ProtocolLevel != 0 {
+			clientProto = entry.ctx.ProtocolLevel
+		}
+
 		outPub := &protocol.PublishPacket{
-			Topic:      p.Topic,
-			Payload:    p.Payload,
-			QoS:        grantedQoS,
-			Retain:     retainFlag,
-			Properties: p.Properties,
+			ProtocolLevel: clientProto,
+			Topic:         p.Topic,
+			Payload:       p.Payload,
+			QoS:           grantedQoS,
+			Retain:        retainFlag,
+			Properties:    p.Properties,
 		}
 
 		if grantedQoS == protocol.QoS0 {
-			if !qos0Encoded {
-				outPub.PacketID = 0
-				qos0Bytes, _ = outPub.Encode()
-				qos0Encoded = true
+			var wireBytes []byte
+			if clientProto == protocol.V50 {
+				if !qos0V5Encoded {
+					outPub.PacketID = 0
+					qos0BytesV5, _ = outPub.Encode()
+					qos0V5Encoded = true
+				}
+				wireBytes = qos0BytesV5
+			} else {
+				if !qos0V3Encoded {
+					outPub.PacketID = 0
+					qos0BytesV3, _ = outPub.Encode()
+					qos0V3Encoded = true
+				}
+				wireBytes = qos0BytesV3
 			}
-			_, _ = entry.conn.Write(qos0Bytes)
+			_, _ = entry.conn.Write(wireBytes)
 			s.metrics.IncMsgSent(0)
 			s.metrics.AddBytesSent(len(p.Payload))
 		} else {

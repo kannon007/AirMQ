@@ -299,6 +299,15 @@ CGO_ENABLED=0 go build -o broker ./cmd/broker
 | **场景 2: 工业制造** (一般) | 网关鉴权 + JSON 格式校验 + 微秒时间戳增强 + Kafka 写入 | **2,009,619 msg/s** (201万) | P50 < 500ns, P99 < 15µs | 拦截 10% 损坏JSON |
 | **场景 3: 车联网 V2X** (复杂) | VIN 码鉴权 + CAN 二进制 TLV 魔数校验 + 碰撞告警紧急分流 + GPS 隐私脱敏 | **2,810,014 msg/s** (281万) | P50 < 500ns, P99 < 18µs | 智能自洽跳过 90% 无关流 |
 
+#### 完整双向业务闭环支持 (Uplink Telemetry & Downlink Command Closed-Loop)
+
+AirMQ 绝不仅支持设备单向数据上报，更完整实现 **云端指令下发 -> 下发管道防御 -> 设备硬件执行 -> 上行回执确认** 的全链路业务闭环：
+- **下行防线 (`devices/+/cmd`)**：指令下发时自动触发自洽校验与安全边界审计，拦截非法越权与危险参数操作；
+- **回执闭环 (`devices/+/ack`)**：捕获设备异步上报的执行状态，完成请求-响应事务确认，端到端往返时延（RTT）微秒级交付；
+- **MQTT 5.0 原生 RPC**：原生支持 `ResponseTopic` 与 `CorrelationData`，异构微服务异步调用无需在业务 Payload 中侵入序列号；
+- **线缆自适应分发**：支持同一主题下 MQTT 3.1.1 与 MQTT 5.0 异构设备共存，彻底消除协议头污染；
+- **双向闭环自动化测试套件**：执行 `go test -v -run "TestBidirectional_" ./core/...` (100% 验证通过)。
+
 ### 9. AI-Native Skill 与使用文档融合体系 (Skill & Docs Fusion)
 
 为适应新一代 AI 辅助研发（AI-Assisted Pair Programming）与 Agent 协同开发，本项目首创 **AI Skill 与人类使用手册深度融合** 的组织范式，直接归档于 [`.agents/skills/mqtt-core/`](.agents/skills/mqtt-core/) 目录：

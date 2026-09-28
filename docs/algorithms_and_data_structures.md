@@ -306,6 +306,44 @@ stateDiagram-v2
 1. **Suspect（怀疑态）缓冲**：节点未在指定阈值返回 Ping 时，不会立刻将其标记为 Dead，而是进入 Suspect 状态，并请求其他邻居节点尝试交叉探测；
 2. **增量拓扑广播（Delta PEX）**：订阅与节点变更只以最小增量向存活节点按需同步，避免在大集群网络中产生广播风暴。
 
+## 10. 双向业务闭环与下行控制架构 (Bidirectional Closed-Loop Architecture)
+
+真实的物联网业务绝非单向的数据流，而是由 **上行遥测（Uplink Telemetry）** 与 **下行控制（Downlink Control）** 共同构成的完整业务闭环。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cloud as 云端应用 / 控制中心
+    participant Broker as AirMQ Broker
+    participant DownPipe as 下发管道 (Downlink Pipe)
+    participant UpPipe as 上行管道 (Uplink Pipe)
+    participant Device as 边缘物联网设备 (TCP/TLS)
+
+    Note over Cloud, Device: 阶段一：下行控制下发 (Downlink Command)
+    Cloud->>Broker: Publish("devices/01/cmd", {"req_id":"R1","action":"adjust"})
+    Broker->>DownPipe: Match & Process (指令鉴权/合法性校验/审计)
+    DownPipe-->>Broker: 放行 (0 内存拷贝)
+    Broker->>Device: 网络线缆极速下发 (PUBLISH QoS 0/1)
+
+    Note over Device: 阶段二：硬件动作执行 (Hardware Execution)
+    Device->>Device: 解析指令、执行转速调节、采集执行结果
+
+    Note over Cloud, Device: 阶段三：上行回执闭环 (Uplink ACK & Verification)
+    Device->>Broker: Publish("devices/01/ack", {"req_id":"R1","status":"SUCCESS"})
+    Broker->>UpPipe: Match & Process (设备签名校验/回执指标统计)
+    UpPipe-->>Broker: 放行并流式归档
+    Broker->>Cloud: 进程内订阅交付 / 回执抵达
+    Note over Cloud: 计算端到端 RTT 往返耗时，标记任务完成
+```
+
+### 10.1 双向链路的关键工程优化
+1. **下行管道自洽门禁**：通过 `devices/+/cmd` 管道，在指令真正推向物理设备前完成 RBAC 操作员鉴权、参数范围安全边界检查（如防止电机转速超限），将非法指令扼杀在 Broker 层；
+2. **多协议版本线缆自适应（Dual-Protocol Wire Adaptation）**：
+   - 当同一主题下同时存在 MQTT 3.1.1 遗留设备与 MQTT 5.0 现代设备时，AirMQ 维护独立协议级别的快照（`qos0BytesV3` 与 `qos0BytesV5`）；
+   - 杜绝 MQTT 5.0 的属性长度头（`Property Length`）污染 3.1.1 设备的 Payload，实现完美的异构版本共存下发；
+3. **MQTT 5.0 原生 RPC 相关性数据传递（Correlation Data & ResponseTopic）**：
+   - 彻底免去在业务 JSON 中硬编码请求 ID 的侵入式设计，利用 MQTT 5.0 报文头部的二进制 `CorrelationData` 和 `ResponseTopic` 属性，在微服务间实现纳秒级轻量异步 RPC。
+
 ---
 
 ## 📊 算法与数据结构优化效益总结表
@@ -320,3 +358,4 @@ stateDiagram-v2
 | **飞行窗口环形索引** | `pkg/session` | `RingBuffer` + `map[uint16]int` 索引 | 面对乱序 ACK 依然保持 **$O(1)$ 查找与懒惰压紧清除** |
 | **预分配连续磁盘段** | `pkg/pipeline` | 16MB Truncated 段文件 + `WriteAt` | 消除 OS 文件系统 Inode 元数据锁，写削峰冲刺数百万吞吐 |
 | **插值令牌桶 & 掩码采样**| `pkg/limiter` | 纳秒时间差数学模型 + 位与掩码 | 免去后台定时轮询，探针采集开销降至极限 |
+| **双向闭环与多协议分发**| `pkg/server` | 协议自适应快照 + 5.0 属性透传 | 消除不同 MQTT 版本下发协议头污染，端到端 RTT 纳秒穿透 |

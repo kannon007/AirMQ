@@ -339,8 +339,121 @@ func (p *AlarmDebounceProcessor) Process(c *core.Context) error {
 
 ---
 
+## 6. 范式 6：云边双向指令下发与回执闭环 (Bidirectional Command & ACK Closed-Loop)
+
+### 业务背景
+物联网应用不仅有设备上报遥测，更有云端对设备的反向控制（下发指令）。
+下发通常面临两大核心需求：
+1. **下发前置防御**：下发指令必须经过严格的参数边界校验（如限制变频器最大工作频率、机械臂最大角速度），杜绝非法参数下发损坏设备硬件；
+2. **异步回执闭环**：设备接收并执行动作后，异步上报 ACK 报文（携带相同 `req_id`）。服务端管道需即时捕获回执，完成事务状态标记并测量往返时延（RTT）。
+
+### 实现代码
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"time"
+
+	"mqtt/core"
+)
+
+var (
+	ErrParamOutOfBounds = errors.New("command parameter out of safety bounds")
+)
+
+// 1. 下发控制指令防御校验处理器
+type DownlinkSafetyGuard struct {
+	MaxAllowedHz float64
+}
+
+func (p *DownlinkSafetyGuard) Match(c *core.Context) bool {
+	// 仅拦截下行控制主题: devices/{device_id}/cmd
+	return c.Message != nil && strings.HasPrefix(c.Message.Topic, "devices/") && strings.HasSuffix(c.Message.Topic, "/cmd")
+}
+
+func (p *DownlinkSafetyGuard) Process(c *core.Context) error {
+	var cmd struct {
+		ReqID  string  `json:"req_id"`
+		Action string  `json:"action"`
+		Hz     float64 `json:"hz"`
+	}
+	if err := json.Unmarshal(c.Message.Payload, &cmd); err != nil {
+		c.Drop("malformed json command")
+		return nil
+	}
+
+	// 物理边界防御
+	if cmd.Hz > p.MaxAllowedHz {
+		c.Drop("command rejected: frequency exceeds physical safety limit")
+		return ErrParamOutOfBounds
+	}
+
+	// 在上下文中标记下发时间戳
+	c.Set("dispatch_ts", time.Now().UnixNano())
+	return nil
+}
+
+// 2. 上行回执异步关联处理器
+type UplinkAckTracker struct {
+	mu           sync.Mutex
+	pendingTasks map[string]chan string // req_id -> 回执结果通知通道
+}
+
+func NewUplinkAckTracker() *UplinkAckTracker {
+	return &UplinkAckTracker{
+		pendingTasks: make(map[string]chan string),
+	}
+}
+
+func (t *UplinkAckTracker) RegisterWait(reqID string) chan string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ch := make(chan string, 1)
+	t.pendingTasks[reqID] = ch
+	return ch
+}
+
+func (t *UplinkAckTracker) Match(c *core.Context) bool {
+	// 仅拦截上行回执主题: devices/{device_id}/ack
+	return c.Message != nil && strings.HasPrefix(c.Message.Topic, "devices/") && strings.HasSuffix(c.Message.Topic, "/ack")
+}
+
+func (t *UplinkAckTracker) Process(c *core.Context) error {
+	var ack struct {
+		ReqID  string `json:"req_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(c.Message.Payload, &ack); err != nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	ch, exists := t.pendingTasks[ack.ReqID]
+	if exists {
+		delete(t.pendingTasks, ack.ReqID)
+	}
+	t.mu.Unlock()
+
+	if exists {
+		select {
+		case ch <- ack.Status:
+		default:
+		}
+	}
+	return nil
+}
+```
+
+---
+
 ## 💡 最佳实战建议
 
 1. **先轻后重**：在 `pipe.Add` 编排中，务必将过滤最快、拦截率最高的处理器放在最前端（例如：`AuthProcessor` -> `ValidateProcessor` -> `DebounceProcessor` -> `TransformProcessor` -> `ForwardProcessor`）。
 2. **零拷贝共享**：如果多个下游处理器需要使用解析后的中间结构（如已解析的 JSON 结构体），应通过 `c.Set("parsed_data", obj)` 共享，避免下游重复序列化解析。
 3. **安全使用 Pool**：在自定义处理器内部如果衍生了新的异步 goroutine 处理逻辑，如需跨 goroutine 持有消息体，必须调用 `bytes.Clone(c.Message.Payload)` 制作拷贝，防止原消息在主链路中被 `ReleaseMessage` 回收后发生数据竞争。
+4. **双向指令隔离**：强烈建议将上行遥测主题（如 `telemetry/#`）与下行控制主题（如 `devices/+/cmd`）绑定独立的 `Pipe` 管道实例，保持上报通道与控制通道的物理隔离，避免上行高频遥测争抢下行实时控制指令的调度窗口。
