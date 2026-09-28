@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/broker
+/bench
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.html
+
+# Local runtime spool and data files
+*.seg
+*.meta
+*.log
+*.tmp
+*.tmp.*
+data/
+pebble_data/
+badger_data/
+pipeline_spool/
+
+# Frontend build & dependencies
+web/node_modules/
+web/.pnpm-store/
+.npm/
+.pnpm-debug.log*
+web/.vite/
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
