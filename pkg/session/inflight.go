@@ -92,3 +92,17 @@ func (q *InflightQueue) Len() int {
 	q.mu.Unlock()
 	return c
 }
+
+// GetPending returns a snapshot of all unacknowledged inflight messages in order.
+func (q *InflightQueue) GetPending() []*InflightMessage {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	res := make([]*InflightMessage, 0, q.count)
+	for i := 0; i < q.capacity; i++ {
+		idx := (q.head + i) % q.capacity
+		if q.entries[idx] != nil {
+			res = append(res, q.entries[idx])
+		}
+	}
+	return res
+}

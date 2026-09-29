@@ -27,13 +27,14 @@ import (
 
 // Config configures the MQTT server engine.
 type Config struct {
-	Addr         string // e.g. "tcp://0.0.0.0:1883"
-	Multicore    bool
-	ReusePort    bool
-	TCPKeepAlive time.Duration
-	ConnLimit    limiter.ConnLimiterConfig
-	PublishLimit limiter.PublishLimiterConfig
-	MetricsAddr  string // Optional dedicated Prometheus metrics HTTP address (e.g. ":8080")
+	Addr             string // e.g. "tcp://0.0.0.0:1883"
+	Multicore        bool
+	ReusePort        bool
+	TCPKeepAlive     time.Duration
+	HandshakeTimeout time.Duration // Max duration to wait for CONNECT packet (defaults to 10s)
+	ConnLimit        limiter.ConnLimiterConfig
+	PublishLimit     limiter.PublishLimiterConfig
+	MetricsAddr      string // Optional dedicated Prometheus metrics HTTP address (e.g. ":8080")
 }
 
 // Server is the high-performance MQTT Broker engine built atop gnet/v2.
@@ -50,6 +51,7 @@ type Server struct {
 	pipeline        *pipeline.Pipeline
 	pipelineRouter  *pipeline.Router
 	conns           sync.Map // clientID -> *clientEntry
+	unauthedConns   sync.Map // gnet.Conn -> *ConnContext (Slowloris pre-auth timeout defense)
 	stopHeartbeat   chan struct{}
 	tlsServer       *TLSServer
 	wsServer        *WSServer
@@ -170,6 +172,30 @@ func (s *Server) startHeartbeatLoop() {
 		case <-s.stopHeartbeat:
 			return
 		case now := <-ticker.C:
+			// 1. Check unauthenticated connections for handshake timeout (Slowloris defense)
+			handshakeTimeout := s.cfg.HandshakeTimeout
+			if handshakeTimeout <= 0 {
+				handshakeTimeout = 10 * time.Second
+			}
+			s.unauthedConns.Range(func(key, value any) bool {
+				conn, ok := key.(gnet.Conn)
+				if !ok {
+					return true
+				}
+				uctx, ok := value.(*ConnContext)
+				if !ok || uctx == nil {
+					return true
+				}
+				if !uctx.Authed && now.Sub(uctx.ConnectedAt) > handshakeTimeout {
+					log.Printf("Unauthenticated connection %s handshake timed out (%v > %v), evicting",
+						conn.RemoteAddr(), now.Sub(uctx.ConnectedAt), handshakeTimeout)
+					_ = conn.Close()
+					s.unauthedConns.Delete(key)
+				}
+				return true
+			})
+
+			// 2. KeepAlive eviction for authenticated active connections
 			s.conns.Range(func(key, value any) bool {
 				entry, ok := value.(*clientEntry)
 				if !ok || entry.ctx == nil || entry.ctx.KeepAlive <= 0 {
@@ -184,7 +210,7 @@ func (s *Server) startHeartbeatLoop() {
 				return true
 			})
 
-			// Garbage collect expired MQTT sessions
+			// 3. Garbage collect expired MQTT sessions
 			expiredSessions := s.sessionMgr.CleanExpiredSessions(now)
 			for _, sess := range expiredSessions {
 				for topic := range sess.GetSubscriptions() {
@@ -212,12 +238,15 @@ func (s *Server) Start() error {
 // OnOpen is called when a new socket connects.
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	s.metrics.IncConnActive("tcp")
-	c.SetContext(NewConnContext())
+	ctx := NewConnContext()
+	c.SetContext(ctx)
+	s.unauthedConns.Store(c, ctx)
 	return nil, gnet.None
 }
 
 // OnClose is called when a socket is disconnected.
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	s.unauthedConns.Delete(c)
 	ctx, ok := c.Context().(*ConnContext)
 	if ok && ctx != nil && ctx.ClientID != "" {
 		s.closeClient(ctx, c.RemoteAddr().String(), err)
@@ -493,6 +522,11 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 		ctx.SessionExpirySeconds = *p.Properties.SessionExpiryInterval
 	}
 
+	// MQTT 5.0 Maximum Packet Size
+	if p.Properties != nil && p.Properties.MaximumPacketSize != nil {
+		ctx.MaxPacketSize = *p.Properties.MaximumPacketSize
+	}
+
 	hookCtx := hook.NewClientContext(p.ClientID, p.Username, c.RemoteAddr().String())
 	allowed, code, err := s.hookMgr.FireConnect(hookCtx, p)
 	if err != nil || !allowed {
@@ -513,6 +547,9 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 	ctx.Username = p.Username
 	ctx.Authed = true
 	ctx.KeepAlive = time.Duration(p.KeepAlive) * time.Second
+	if gc, ok := c.(*gnetClientConn); ok {
+		s.unauthedConns.Delete(gc.RawConn())
+	}
 
 	if oldSess, ok := s.sessionMgr.Get(p.ClientID); ok {
 		if p.CleanSession || oldSess.IsExpired(time.Now()) {
@@ -558,8 +595,22 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 	data, _ := connack.Encode()
 	_, _ = c.Write(data)
 
-	// Replay offline messages for persistent session
+	// Replay inflight and offline messages for persistent session
 	if !p.CleanSession {
+		// 1. Replay unacknowledged inflight messages with DUP=1 (per MQTT-4.3.2-1 & 4.4)
+		if sess.Inflight != nil {
+			for _, inflight := range sess.Inflight.GetPending() {
+				if inflight != nil && inflight.Packet != nil {
+					inflight.Packet.Dup = true
+					inflight.Retries++
+					if enc, err := inflight.Packet.Encode(); err == nil {
+						_, _ = c.Write(enc)
+					}
+				}
+			}
+		}
+
+		// 2. Replay offline messages that arrived while disconnected
 		offlineMsgs, err := s.store.FetchOffline(p.ClientID)
 		if err == nil && len(offlineMsgs) > 0 {
 			for _, msg := range offlineMsgs {
@@ -804,6 +855,9 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 				}
 				wireBytes = qos0BytesV3[rIdx]
 			}
+			if entry.ctx != nil && entry.ctx.MaxPacketSize > 0 && uint32(len(wireBytes)) > entry.ctx.MaxPacketSize {
+				continue
+			}
 			_, _ = entry.conn.Write(wireBytes)
 			s.metrics.IncMsgSent(0)
 			s.metrics.AddBytesSent(len(p.Payload))
@@ -828,6 +882,9 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 			}
 			encoded, err := outPub.Encode()
 			if err == nil {
+				if entry.ctx != nil && entry.ctx.MaxPacketSize > 0 && uint32(len(encoded)) > entry.ctx.MaxPacketSize {
+					continue
+				}
 				_, _ = entry.conn.Write(encoded)
 				s.metrics.IncMsgSent(grantedQoS)
 				s.metrics.AddBytesSent(len(p.Payload))

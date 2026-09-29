@@ -1749,6 +1749,312 @@ func TestMQTT_CrossVersion_311Pub_50Sub_And_ViceVersa(t *testing.T) {
 	sendPkt(t, v3SubConn, &protocol.PubackPacket{PacketID: v3Recv.PacketID})
 }
 
+func TestMQTT_DollarSystemTopic_WildcardIsolation(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Client 1 subscribes to '#'
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial c1: %v", err)
+	}
+	defer c1.Close()
+	sendPkt(t, c1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "global-wildcard-sub",
+	})
+	_ = recvPkt(t, c1, protocol.V311)
+	sendPkt(t, c1, &protocol.SubscribePacket{
+		PacketID: 1,
+		Topics:   []protocol.TopicSub{{Topic: "#", QoS: 0}},
+	})
+	_ = recvPkt(t, c1, protocol.V311)
+
+	// 2. Client 2 subscribes to '$SYS/#'
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial c2: %v", err)
+	}
+	defer c2.Close()
+	sendPkt(t, c2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "sys-explicit-sub",
+	})
+	_ = recvPkt(t, c2, protocol.V311)
+	sendPkt(t, c2, &protocol.SubscribePacket{
+		PacketID: 2,
+		Topics:   []protocol.TopicSub{{Topic: "$SYS/#", QoS: 0}},
+	})
+	_ = recvPkt(t, c2, protocol.V311)
+
+	// 3. Publisher publishes to $SYS/broker/version
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial pub: %v", err)
+	}
+	defer pub.Close()
+	sendPkt(t, pub, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "sys-publisher",
+	})
+	_ = recvPkt(t, pub, protocol.V311)
+
+	sysPayload := []byte("airmq-v1.0.0")
+	sendPkt(t, pub, &protocol.PublishPacket{
+		Topic:   "$SYS/broker/version",
+		Payload: sysPayload,
+		QoS:     0,
+	})
+
+	// c2 ($SYS/#) MUST receive it
+	rec2 := recvPkt(t, c2, protocol.V311).(*protocol.PublishPacket)
+	if rec2.Topic != "$SYS/broker/version" || !bytes.Equal(rec2.Payload, sysPayload) {
+		t.Fatalf("c2 expected $SYS payload, got: %s", string(rec2.Payload))
+	}
+
+	// c1 (#) MUST NOT receive it
+	_ = c1.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 128)
+	n, readErr := c1.Read(buf)
+	if readErr == nil && n > 0 {
+		t.Fatalf("c1 (#) illegally matched $SYS topic, received %d bytes: %x", n, buf[:n])
+	}
+}
+
+func TestMQTT_InflightRetransmit_WithDUP_OnReconnect(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	clientID := "inflight-retransmit-client"
+
+	// 1. Client connects with CleanSession = false
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial c1: %v", err)
+	}
+	sendPkt(t, c1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  false,
+		ClientID:      clientID,
+	})
+	_ = recvPkt(t, c1, protocol.V311)
+
+	// 2. Client subscribes to orders/pending with QoS 1
+	sendPkt(t, c1, &protocol.SubscribePacket{
+		PacketID: 10,
+		Topics:   []protocol.TopicSub{{Topic: "orders/pending", QoS: 1}},
+	})
+	_ = recvPkt(t, c1, protocol.V311)
+
+	// 3. Publisher connects and sends a QoS 1 message
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial pub: %v", err)
+	}
+	defer pub.Close()
+	sendPkt(t, pub, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "orders-publisher",
+	})
+	_ = recvPkt(t, pub, protocol.V311)
+
+	msgPayload := []byte("order-payload-1001")
+	sendPkt(t, pub, &protocol.PublishPacket{
+		Topic:    "orders/pending",
+		Payload:  msgPayload,
+		QoS:      1,
+		PacketID: 55,
+	})
+	_ = recvPkt(t, pub, protocol.V311) // PUBACK to pub
+
+	// 4. c1 receives the message for the first time (Dup must be false)
+	firstRecv := recvPkt(t, c1, protocol.V311).(*protocol.PublishPacket)
+	if firstRecv.Dup {
+		t.Fatalf("Expected Dup=false on first delivery")
+	}
+	originalPID := firstRecv.PacketID
+
+	// 5. Abruptly close c1 WITHOUT sending PUBACK!
+	_ = c1.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// 6. Reconnect with CleanSession = false
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to reconnect c2: %v", err)
+	}
+	defer c2.Close()
+
+	sendPkt(t, c2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  false,
+		ClientID:      clientID,
+	})
+	ack := recvPkt(t, c2, protocol.V311).(*protocol.ConnackPacket)
+	if !ack.SessionPresent {
+		t.Fatalf("Expected SessionPresent=true on reconnect")
+	}
+
+	// 7. c2 MUST receive the unacknowledged message with Dup=true and same PacketID!
+	retransmitted := recvPkt(t, c2, protocol.V311).(*protocol.PublishPacket)
+	if !retransmitted.Dup {
+		t.Fatalf("Expected Dup=true on retransmitted unacknowledged message")
+	}
+	if retransmitted.PacketID != originalPID {
+		t.Fatalf("Expected PacketID to match %d, got %d", originalPID, retransmitted.PacketID)
+	}
+	if !bytes.Equal(retransmitted.Payload, msgPayload) {
+		t.Fatalf("Payload mismatch on retransmit: got %s, want %s", string(retransmitted.Payload), string(msgPayload))
+	}
+
+	// 8. Now c2 sends PUBACK
+	sendPkt(t, c2, &protocol.PubackPacket{PacketID: retransmitted.PacketID})
+	time.Sleep(50 * time.Millisecond)
+
+	// 9. Reconnect once more: should receive NO duplicate messages
+	c3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to reconnect c3: %v", err)
+	}
+	defer c3.Close()
+	sendPkt(t, c3, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  false,
+		ClientID:      clientID,
+	})
+	_ = recvPkt(t, c3, protocol.V311)
+
+	_ = c3.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 128)
+	n, readErr := c3.Read(buf)
+	if readErr == nil && n > 0 {
+		t.Fatalf("Expected no messages after ACK, but got %d bytes: %x", n, buf[:n])
+	}
+}
+
+func TestMQTT_PreAuth_HandshakeTimeout_Eviction(t *testing.T) {
+	gnetAddr, dialAddr := getNextAddr()
+	srv := NewServer(Config{
+		Addr:             gnetAddr,
+		Multicore:        false,
+		TCPKeepAlive:     30 * time.Second,
+		HandshakeTimeout: 1 * time.Second,
+	}, nil, nil, nil)
+
+	go func() {
+		_ = srv.Start()
+	}()
+	time.Sleep(150 * time.Millisecond)
+	defer func() {
+		_ = srv.Stop(context.Background())
+		time.Sleep(50 * time.Millisecond)
+	}()
+
+	// 1. Slowloris client: dials and sends only 1 byte, then stalls
+	slowConn, err := net.Dial("tcp", dialAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer slowConn.Close()
+
+	_, _ = slowConn.Write([]byte{0x10}) // Send incomplete 1 byte of CONNECT
+
+	// 2. Wait 1.8 seconds (> 1s HandshakeTimeout)
+	time.Sleep(1800 * time.Millisecond)
+
+	// 3. Broker must have evicted and closed this slow unauthenticated connection
+	_ = slowConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 16)
+	n, readErr := slowConn.Read(buf)
+	if readErr == nil && n > 0 {
+		t.Fatalf("Expected slow connection to be evicted and closed, but read %d bytes", n)
+	}
+}
+
+func TestMQTT50_MaximumPacketSize_Enforcement(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	maxSize := uint32(64) // Client only accepts up to 64 bytes total packet size
+
+	subConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial subscriber: %v", err)
+	}
+	defer subConn.Close()
+
+	sendPkt(t, subConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    true,
+		ClientID:      "constrained-iot-node",
+		Properties: &protocol.Properties{
+			MaximumPacketSize: &maxSize,
+		},
+	})
+	_ = recvPkt(t, subConn, protocol.V50)
+
+	sendPkt(t, subConn, &protocol.SubscribePacket{
+		PacketID:      1,
+		ProtocolLevel: protocol.V50,
+		Topics:        []protocol.TopicSub{{Topic: "sensor/firmware", QoS: 0}},
+	})
+	_ = recvPkt(t, subConn, protocol.V50)
+
+	pubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial publisher: %v", err)
+	}
+	defer pubConn.Close()
+
+	sendPkt(t, pubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    true,
+		ClientID:      "firmware-publisher",
+	})
+	_ = recvPkt(t, pubConn, protocol.V50)
+
+	// 1. Publish 200-byte message (wire size > 200 bytes, exceeds 64 byte limit)
+	largePayload := bytes.Repeat([]byte("A"), 200)
+	sendPkt(t, pubConn, &protocol.PublishPacket{
+		ProtocolLevel: protocol.V50,
+		Topic:         "sensor/firmware",
+		Payload:       largePayload,
+		QoS:           0,
+	})
+
+	// 2. Publish 10-byte message (wire size ~ 25 bytes, fits in 64 byte limit)
+	smallPayload := []byte("small-data")
+	sendPkt(t, pubConn, &protocol.PublishPacket{
+		ProtocolLevel: protocol.V50,
+		Topic:         "sensor/firmware",
+		Payload:       smallPayload,
+		QoS:           0,
+	})
+
+	// Subscriber MUST receive the small packet, and large packet must NOT have been delivered
+	recv := recvPkt(t, subConn, protocol.V50).(*protocol.PublishPacket)
+	if !bytes.Equal(recv.Payload, smallPayload) {
+		t.Fatalf("Expected small payload to be received, got: %s", string(recv.Payload))
+	}
+}
+
+
+
+
+
 
 
 

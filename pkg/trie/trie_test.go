@@ -132,6 +132,38 @@ func TestRouter_AllDataWildcardAndShared(t *testing.T) {
 	}
 }
 
+func TestTopicTree_DollarSystemTopic_WildcardIsolation(t *testing.T) {
+	tree := NewTopicTree(nil)
+
+	// Sub1 subscribes to '#' (global wildcard)
+	tree.Subscribe("#", "wildcard-sub", 1)
+	// Sub2 subscribes to '+/+' (single level wildcards)
+	tree.Subscribe("+/+", "plus-sub", 1)
+	// Sub3 explicitly subscribes to '$SYS/#'
+	tree.Subscribe("$SYS/#", "sys-sub", 1)
+
+	// 1. Publishing to a $SYS topic: only Sub3 should match!
+	matchedSys := tree.Match("$SYS/broker/uptime")
+	if len(matchedSys) != 1 || matchedSys[0].ClientID != "sys-sub" {
+		t.Fatalf("Expected only sys-sub for $SYS topic, got: %+v", matchedSys)
+	}
+
+	// 2. Publishing to normal topic: Sub1 and Sub2 should match, Sub3 must not!
+	matchedNormal := tree.Match("sensor/temp")
+	if len(matchedNormal) != 2 {
+		t.Fatalf("Expected 2 subscribers for sensor/temp, got: %d", len(matchedNormal))
+	}
+	foundSys := false
+	for _, m := range matchedNormal {
+		if m.ClientID == "sys-sub" {
+			foundSys = true
+		}
+	}
+	if foundSys {
+		t.Fatalf("sys-sub should not match normal topic sensor/temp")
+	}
+}
+
 func BenchmarkTopicTreeMatch(b *testing.B) {
 	tree := NewTopicTree(nil)
 	// Seed 1000 subscriptions

@@ -181,7 +181,8 @@ func (t *TopicTree) Match(topic string) []Subscriber {
 	regularMap := make(map[string]Subscriber)
 	sharedMap := make(map[string][]Subscriber)
 
-	t.matchRecursive(t.root, tokens, 0, regularMap, sharedMap)
+	isDollar := strings.HasPrefix(topic, "$")
+	t.matchRecursive(t.root, tokens, 0, regularMap, sharedMap, isDollar)
 	t.mu.RUnlock()
 
 	totalCount := len(regularMap) + len(sharedMap)
@@ -228,9 +229,12 @@ func (t *TopicTree) selectSharedMember(group string, members []Subscriber) Subsc
 	return members[idx]
 }
 
-func (t *TopicTree) matchRecursive(curr *Node, tokens []uint32, depth int, regular map[string]Subscriber, shared map[string][]Subscriber) {
+func (t *TopicTree) matchRecursive(curr *Node, tokens []uint32, depth int, regular map[string]Subscriber, shared map[string][]Subscriber, isDollar bool) {
+	// MQTT spec 4.7.2: Topics starting with '$' cannot be matched by wildcards (# or +) at the first level
+	skipWildcardAtRoot := depth == 0 && isDollar
+
 	// 1. Multi-level wildcard '#' matches everything from this level onward
-	if curr.hasWildcardChild {
+	if curr.hasWildcardChild && !skipWildcardAtRoot {
 		if hashNode, exists := curr.children[TokenHash]; exists {
 			for cid, sub := range hashNode.subscribers {
 				if oldSub, ok := regular[cid]; !ok || sub.QoS > oldSub.QoS {
@@ -264,13 +268,13 @@ func (t *TopicTree) matchRecursive(curr *Node, tokens []uint32, depth int, regul
 
 	// 2. Exact child match
 	if child, exists := curr.children[currTok]; exists {
-		t.matchRecursive(child, tokens, depth+1, regular, shared)
+		t.matchRecursive(child, tokens, depth+1, regular, shared, isDollar)
 	}
 
 	// 3. Single-level wildcard '+' child match
-	if curr.hasWildcardChild {
+	if curr.hasWildcardChild && !skipWildcardAtRoot {
 		if plusNode, exists := curr.children[TokenPlus]; exists {
-			t.matchRecursive(plusNode, tokens, depth+1, regular, shared)
+			t.matchRecursive(plusNode, tokens, depth+1, regular, shared, isDollar)
 		}
 	}
 }

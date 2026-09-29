@@ -80,11 +80,15 @@ type ConnContext struct {
 	IsTLS                bool
 	ClientCertCN         string // Extracted from client certificate in mTLS
 	Transport            string // "tcp", "tls", or "ws"
+	ConnectedAt          time.Time
+	MaxPacketSize        uint32 // MQTT 5.0 Maximum Packet Size (0 = unlimited)
 }
 
 func NewConnContext() *ConnContext {
+	now := time.Now()
 	return &ConnContext{
-		LastActive:    time.Now(),
+		ConnectedAt:   now,
+		LastActive:    now,
 		ProtocolLevel: protocol.V311,
 		Transport:     "tcp",
 	}
