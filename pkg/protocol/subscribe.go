@@ -39,11 +39,17 @@ func (p *SubscribePacket) Encode() ([]byte, error) {
 	var varHeader []byte
 	varHeader = binary.BigEndian.AppendUint16(varHeader, p.PacketID)
 
-	isV5 := p.ProtocolLevel == V50 || p.Properties != nil
-	for _, sub := range p.Topics {
-		if sub.NoLocal || sub.RetainAsPublished || sub.RetainHandling > 0 {
+	isV5 := p.ProtocolLevel == V50
+	if p.ProtocolLevel == 0 {
+		if p.Properties != nil {
 			isV5 = true
-			break
+		} else {
+			for _, sub := range p.Topics {
+				if sub.NoLocal || sub.RetainAsPublished || sub.RetainHandling > 0 {
+					isV5 = true
+					break
+				}
+			}
 		}
 	}
 
@@ -172,7 +178,7 @@ func (p *SubackPacket) Encode() ([]byte, error) {
 		codes = p.ReasonCodes
 	}
 
-	isV5 := p.ProtocolLevel == V50 || (p.Properties != nil && !p.Properties.IsEmpty())
+	isV5 := p.ProtocolLevel == V50 || (p.ProtocolLevel == 0 && p.Properties != nil && !p.Properties.IsEmpty())
 	var propBytes []byte
 	if isV5 {
 		propBytes = EncodeProperties(p.Properties)
@@ -248,7 +254,7 @@ func (p *UnsubscribePacket) Encode() ([]byte, error) {
 	var varHeader []byte
 	varHeader = binary.BigEndian.AppendUint16(varHeader, p.PacketID)
 
-	isV5 := p.ProtocolLevel == V50 || (p.Properties != nil && !p.Properties.IsEmpty())
+	isV5 := p.ProtocolLevel == V50 || (p.ProtocolLevel == 0 && p.Properties != nil && !p.Properties.IsEmpty())
 	if isV5 {
 		propBytes := EncodeProperties(p.Properties)
 		varHeader = append(varHeader, propBytes...)

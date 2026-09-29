@@ -1631,6 +1631,125 @@ func TestMQTT_RapidConnectDisconnect_Churn(t *testing.T) {
 	wg.Wait()
 }
 
+func TestMQTT_CrossVersion_311Pub_50Sub_And_ViceVersa(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// -------------------------------------------------------------
+	// Part 1: MQTT 3.1.1 Publisher -> MQTT 5.0 Subscriber
+	// -------------------------------------------------------------
+	v5SubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer v5SubConn.Close()
+
+	sendPkt(t, v5SubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    true,
+		ClientID:      "cross-v5-sub",
+	})
+	_ = recvPkt(t, v5SubConn, protocol.V50)
+
+	sendPkt(t, v5SubConn, &protocol.SubscribePacket{
+		PacketID:      10,
+		ProtocolLevel: protocol.V50,
+		Topics:        []protocol.TopicSub{{Topic: "cross/v3_to_v5", QoS: 1}},
+	})
+	_ = recvPkt(t, v5SubConn, protocol.V50)
+
+	v3PubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer v3PubConn.Close()
+
+	sendPkt(t, v3PubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "cross-v3-pub",
+	})
+	_ = recvPkt(t, v3PubConn, protocol.V311)
+
+	v3Msg := []byte("payload-from-v311")
+	sendPkt(t, v3PubConn, &protocol.PublishPacket{
+		ProtocolLevel: protocol.V311,
+		Topic:         "cross/v3_to_v5",
+		Payload:       v3Msg,
+		QoS:           1,
+		PacketID:      100,
+	})
+	_ = recvPkt(t, v3PubConn, protocol.V311) // PUBACK to v3 pub
+
+	v5Recv := recvPkt(t, v5SubConn, protocol.V50).(*protocol.PublishPacket)
+	if v5Recv.Topic != "cross/v3_to_v5" || !bytes.Equal(v5Recv.Payload, v3Msg) {
+		t.Fatalf("V5 subscriber payload mismatch: got %s, want %s", string(v5Recv.Payload), string(v3Msg))
+	}
+	sendPkt(t, v5SubConn, &protocol.PubackPacket{PacketID: v5Recv.PacketID, ReasonCode: protocol.ReasonSuccess})
+
+	// -------------------------------------------------------------
+	// Part 2: MQTT 5.0 Publisher (with UserProperties) -> MQTT 3.1.1 Subscriber
+	// -------------------------------------------------------------
+	v3SubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer v3SubConn.Close()
+
+	sendPkt(t, v3SubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "cross-v3-sub",
+	})
+	_ = recvPkt(t, v3SubConn, protocol.V311)
+
+	sendPkt(t, v3SubConn, &protocol.SubscribePacket{
+		PacketID:      20,
+		ProtocolLevel: protocol.V311,
+		Topics:        []protocol.TopicSub{{Topic: "cross/v5_to_v3", QoS: 1}},
+	})
+	_ = recvPkt(t, v3SubConn, protocol.V311)
+
+	v5PubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer v5PubConn.Close()
+
+	sendPkt(t, v5PubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    true,
+		ClientID:      "cross-v5-pub",
+	})
+	_ = recvPkt(t, v5PubConn, protocol.V50)
+
+	v5Msg := []byte("clean-payload-from-v50")
+	var props protocol.Properties
+	props.AddUserProperty("device-id", "DEV-999")
+	props.AddUserProperty("telemetry-type", "voltage")
+
+	sendPkt(t, v5PubConn, &protocol.PublishPacket{
+		ProtocolLevel: protocol.V50,
+		Topic:         "cross/v5_to_v3",
+		Payload:       v5Msg,
+		QoS:           1,
+		PacketID:      200,
+		Properties:    &props,
+	})
+	_ = recvPkt(t, v5PubConn, protocol.V50) // PUBACK to v5 pub
+
+	v3Recv := recvPkt(t, v3SubConn, protocol.V311).(*protocol.PublishPacket)
+	if v3Recv.Topic != "cross/v5_to_v3" || !bytes.Equal(v3Recv.Payload, v5Msg) {
+		t.Fatalf("V3 subscriber received corrupted payload: got %q, want %q", string(v3Recv.Payload), string(v5Msg))
+	}
+	sendPkt(t, v3SubConn, &protocol.PubackPacket{PacketID: v3Recv.PacketID})
+}
+
+
 
 
 

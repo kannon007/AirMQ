@@ -34,7 +34,7 @@ func (p *PublishPacket) Encode() ([]byte, error) {
 	}
 
 	var propBytes []byte
-	if p.ProtocolLevel == V50 || (p.Properties != nil && !p.Properties.IsEmpty()) {
+	if p.ProtocolLevel == V50 || (p.ProtocolLevel == 0 && p.Properties != nil && !p.Properties.IsEmpty()) {
 		propBytes = EncodeProperties(p.Properties)
 		remLen += len(propBytes)
 	}
