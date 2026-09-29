@@ -1327,3 +1327,147 @@ func TestMQTT_Unsubscribe_Flow(t *testing.T) {
 
 	assertNoIncoming(t, subConn, 200*time.Millisecond)
 }
+
+func TestMQTT311_EmptyClientID_CleanSessionFalse_Rejected(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// In MQTT 3.1.1, CleanSession MUST be true if ClientID is empty.
+	// If CleanSession is false, broker MUST reject with IdentifierRejected (0x02) and close connection.
+	sendPkt(t, conn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  false,
+		ClientID:      "",
+	})
+
+	connack := recvPkt(t, conn, protocol.V311).(*protocol.ConnackPacket)
+	if connack.ReturnCode != protocol.CodeIdentifierRejected {
+		t.Fatalf("Expected ReturnCode=0x02 (CodeIdentifierRejected), got: %d", connack.ReturnCode)
+	}
+
+	// Server should close the connection
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err == nil && n > 0 {
+		t.Fatalf("Expected connection closed after IdentifierRejected, but received %d bytes", n)
+	}
+}
+
+func TestMQTT_DuplicateClientID_SessionTakeover(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	// 1. Client 1 connects with ClientID "takeover-target"
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("conn1 dial failed: %v", err)
+	}
+	defer conn1.Close()
+
+	sendPkt(t, conn1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "takeover-target",
+	})
+	_ = recvPkt(t, conn1, protocol.V311)
+
+	// 2. Client 2 connects with the SAME ClientID "takeover-target"
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("conn2 dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	sendPkt(t, conn2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "takeover-target",
+	})
+	connack2 := recvPkt(t, conn2, protocol.V311).(*protocol.ConnackPacket)
+	if connack2.ReturnCode != 0 {
+		t.Fatalf("Expected conn2 to be accepted, got code: %d", connack2.ReturnCode)
+	}
+
+	// 3. Client 1 must be evicted and disconnected by the broker per MQTT spec
+	_ = conn1.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 64)
+	n, err := conn1.Read(buf)
+	if err == nil && n > 0 {
+		t.Fatalf("Expected conn1 to be closed by broker takeover, but read %d bytes", n)
+	}
+}
+
+func TestMQTT_TCP_StickyPackets_And_Fragmentation(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	// Subscriber
+	subConn, _ := net.Dial("tcp", addr)
+	defer subConn.Close()
+	sendPkt(t, subConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "stream-sub",
+	})
+	_ = recvPkt(t, subConn, protocol.V311)
+	sendPkt(t, subConn, &protocol.SubscribePacket{
+		PacketID: 1,
+		Topics:   []protocol.TopicSub{{Topic: "stream/#", QoS: 0}},
+	})
+	_ = recvPkt(t, subConn, protocol.V311)
+
+	// Publisher
+	pubConn, _ := net.Dial("tcp", addr)
+	defer pubConn.Close()
+	sendPkt(t, pubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "stream-pub",
+	})
+	_ = recvPkt(t, pubConn, protocol.V311)
+
+	// --- 1. TCP Sticky Packets (Coalescing): write 2 PUBLISH packets in a single TCP frame ---
+	pkt1 := &protocol.PublishPacket{Topic: "stream/sticky1", Payload: []byte("payload-1"), QoS: 0}
+	pkt2 := &protocol.PublishPacket{Topic: "stream/sticky2", Payload: []byte("payload-2"), QoS: 0}
+	raw1, _ := pkt1.Encode()
+	raw2, _ := pkt2.Encode()
+
+	stickyBytes := append(raw1, raw2...)
+	_, err := pubConn.Write(stickyBytes)
+	if err != nil {
+		t.Fatalf("Failed to write sticky packets: %v", err)
+	}
+
+	rec1 := recvPkt(t, subConn, protocol.V311).(*protocol.PublishPacket)
+	rec2 := recvPkt(t, subConn, protocol.V311).(*protocol.PublishPacket)
+	if rec1.Topic != "stream/sticky1" || rec2.Topic != "stream/sticky2" {
+		t.Fatalf("Sticky packets routing mismatch: rec1=%s, rec2=%s", rec1.Topic, rec2.Topic)
+	}
+
+	// --- 2. TCP Fragmentation (Half-Packet): write 1 PUBLISH split into 2 chunks with pause ---
+	pkt3 := &protocol.PublishPacket{Topic: "stream/fragmented", Payload: []byte("long-fragmented-payload-data"), QoS: 0}
+	raw3, _ := pkt3.Encode()
+
+	splitPoint := len(raw3) / 2
+	_, _ = pubConn.Write(raw3[:splitPoint])
+	time.Sleep(60 * time.Millisecond) // Simulate network transit delay
+	_, _ = pubConn.Write(raw3[splitPoint:])
+
+	rec3 := recvPkt(t, subConn, protocol.V311).(*protocol.PublishPacket)
+	if rec3.Topic != "stream/fragmented" || !bytes.Equal(rec3.Payload, pkt3.Payload) {
+		t.Fatalf("Fragmented packet reconstruction mismatch: got topic=%s, payload=%s", rec3.Topic, string(rec3.Payload))
+	}
+}
+

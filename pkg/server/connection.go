@@ -13,6 +13,7 @@ import (
 // ClientConn defines the common connection interface across TCP (gnet), TLS (crypto/tls), and WebSocket.
 type ClientConn interface {
 	Write(b []byte) (int, error)
+	WriteAndClose(b []byte) error
 	Close() error
 	RemoteAddr() net.Addr
 }
@@ -39,6 +40,12 @@ func (g *gnetClientConn) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	return len(b), nil
+}
+
+func (g *gnetClientConn) WriteAndClose(b []byte) error {
+	return g.c.AsyncWrite(b, func(c gnet.Conn, err error) error {
+		return c.Close()
+	})
 }
 
 func (g *gnetClientConn) Close() error {

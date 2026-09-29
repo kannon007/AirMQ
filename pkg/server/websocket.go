@@ -40,6 +40,13 @@ func (w *wsClientConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (w *wsClientConn) WriteAndClose(b []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.conn.WriteMessage(websocket.BinaryMessage, b)
+	return w.conn.Close()
+}
+
 func (w *wsClientConn) Close() error {
 	return w.conn.Close()
 }

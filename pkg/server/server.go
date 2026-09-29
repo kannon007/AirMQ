@@ -451,8 +451,8 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 				}
 			}
 			data, _ := connack.Encode()
-			_, _ = c.Write(data)
-			return gnet.Close
+			_ = c.WriteAndClose(data)
+			return gnet.None
 		}
 	}
 
@@ -480,8 +480,8 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 			ReasonCode:    protocol.ReasonNotAuthorized,
 		}
 		data, _ := connack.Encode()
-		_, _ = c.Write(data)
-		return gnet.Close
+		_ = c.WriteAndClose(data)
+		return gnet.None
 	}
 
 	s.metrics.IncConnect("success")

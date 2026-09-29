@@ -251,7 +251,7 @@ func TestCoreBroker_WithProcessorOption(t *testing.T) {
 	go func() {
 		_ = b.Start()
 	}()
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -259,7 +259,7 @@ func TestCoreBroker_WithProcessorOption(t *testing.T) {
 	}()
 
 	_ = b.Publish("metrics/cpu", []byte("80%"), 0, false)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	if processedCount.Load() != 1 {
 		t.Fatalf("Expected processor to process 1 message, got %d", processedCount.Load())

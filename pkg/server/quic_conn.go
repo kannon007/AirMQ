@@ -31,7 +31,6 @@ func NewQUICClientConn(sess *quic.Conn, stream *quic.Stream) *quicClientConn {
 	}
 }
 
-// Write transmits raw bytes over the QUIC stream thread-safely.
 func (q *quicClientConn) Write(b []byte) (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -39,6 +38,18 @@ func (q *quicClientConn) Write(b []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	return q.stream.Write(b)
+}
+
+func (q *quicClientConn) WriteAndClose(b []byte) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed.Load() {
+		return net.ErrClosed
+	}
+	_, _ = q.stream.Write(b)
+	q.cancel()
+	q.closed.Store(true)
+	return q.stream.Close()
 }
 
 // Close terminates the stream and signals cancellation to reading goroutines.

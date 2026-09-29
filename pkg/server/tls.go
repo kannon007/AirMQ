@@ -35,6 +35,13 @@ func (t *tlsClientConn) Write(b []byte) (int, error) {
 	return t.conn.Write(b)
 }
 
+func (t *tlsClientConn) WriteAndClose(b []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, _ = t.conn.Write(b)
+	return t.conn.Close()
+}
+
 func (t *tlsClientConn) Close() error {
 	return t.conn.Close()
 }
