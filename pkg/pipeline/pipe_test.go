@@ -367,3 +367,42 @@ func BenchmarkPipe_Execution_Sampled_16(b *testing.B) {
 		_ = p.Execute(ctx, msg)
 	}
 }
+
+func TestPipeline_ProcessorPanicRecovery(t *testing.T) {
+	p := NewPipe()
+	p.Add("safe_proc_1", NewFuncProcessor(
+		func(c *Context) bool { return true },
+		func(c *Context) error {
+			c.Set("stage", "1")
+			return nil
+		},
+	))
+	p.Add("panicking_proc", NewFuncProcessor(
+		func(c *Context) bool { return true },
+		func(c *Context) error {
+			// Deliberate nil-pointer dereference to simulate buggy user processor code
+			var ptr *int
+			*ptr = 42
+			return nil
+		},
+	))
+
+	msg := &Message{Topic: "telemetry/panic_test", Payload: []byte("test")}
+	err := p.Execute(context.Background(), msg)
+	if err == nil {
+		t.Fatal("Expected error after processor panic, got nil")
+	}
+	if !errors.Is(err, ErrProcessorPanicked) && !errors.Is(err, ErrMessageDropped) {
+		t.Fatalf("Expected ErrProcessorPanicked or ErrMessageDropped, got: %v", err)
+	}
+
+	// Verify the pipe remains completely usable after panic
+	p2 := NewPipe().Add("normal_proc", NewFuncProcessor(
+		func(c *Context) bool { return true },
+		func(c *Context) error { return nil },
+	))
+	if err := p2.Execute(context.Background(), msg); err != nil {
+		t.Fatalf("Normal pipeline should execute cleanly: %v", err)
+	}
+}
+

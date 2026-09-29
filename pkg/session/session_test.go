@@ -3,6 +3,7 @@ package session
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"mqtt/pkg/protocol"
 )
@@ -92,3 +93,69 @@ func TestConcurrentSessionManager(t *testing.T) {
 		t.Fatalf("Subscription missing or incorrect QoS: %+v", subs)
 	}
 }
+
+func TestSessionExpiry(t *testing.T) {
+	sm := NewSessionManager()
+	s, _ := sm.GetOrSet("expiring_client", false)
+	s.AddSubscription("test/topic", 1)
+
+	// Currently connected
+	if s.IsExpired(time.Now()) {
+		t.Fatalf("Connected session should not be expired")
+	}
+
+	// Disconnected with 2s expiry
+	now := time.Now()
+	s.SetDisconnected(now, 2)
+
+	// Not yet expired after 1s
+	if s.IsExpired(now.Add(1 * time.Second)) {
+		t.Fatalf("Session should not be expired after 1s")
+	}
+
+	// Expired after 2s
+	if !s.IsExpired(now.Add(2 * time.Second)) {
+		t.Fatalf("Session should be expired after 2s")
+	}
+
+	// Reconnect resets expiry
+	s.SetConnected()
+	if s.IsExpired(now.Add(5 * time.Second)) {
+		t.Fatalf("Reconnected session should not be expired")
+	}
+
+	// Never expires with 0xFFFFFFFF
+	s.SetDisconnected(now, 0xFFFFFFFF)
+	if s.IsExpired(now.Add(1000 * time.Hour)) {
+		t.Fatalf("Session with 0xFFFFFFFF expiry should never expire")
+	}
+}
+
+func TestCleanExpiredSessions(t *testing.T) {
+	sm := NewSessionManager()
+	s1, _ := sm.GetOrSet("client1", false)
+	s2, _ := sm.GetOrSet("client2", false)
+	s3, _ := sm.GetOrSet("client3", false)
+
+	now := time.Now()
+	s1.SetDisconnected(now.Add(-10*time.Second), 5) // Expired 5s ago
+	s2.SetDisconnected(now, 60)                     // Still valid for 60s
+	// s3 remains connected
+	_ = s3
+
+	expired := sm.CleanExpiredSessions(now)
+	if len(expired) != 1 || expired[0].ClientID != "client1" {
+		t.Fatalf("Expected only client1 to be expired, got %v", expired)
+	}
+
+	if _, found := sm.Get("client1"); found {
+		t.Fatalf("client1 should have been deleted from manager")
+	}
+	if _, found := sm.Get("client2"); !found {
+		t.Fatalf("client2 should still be in manager")
+	}
+	if _, found := sm.Get("client3"); !found {
+		t.Fatalf("client3 should still be in manager")
+	}
+}
+

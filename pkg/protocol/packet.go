@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"errors"
+	"strings"
 )
 
 // MQTT Control Packet Types
@@ -43,6 +44,56 @@ var (
 	ErrProtocolViolation  = errors.New("mqtt protocol violation")
 	ErrInvalidPacketType  = errors.New("invalid packet type")
 )
+
+// ValidatePublishTopic verifies that a topic name meets MQTT specification:
+// - Non-empty
+// - No wildcard characters ('+' or '#')
+// - No null character ('\u0000')
+func ValidatePublishTopic(topic string) bool {
+	if len(topic) == 0 {
+		return false
+	}
+	if strings.ContainsAny(topic, "+#\x00") {
+		return false
+	}
+	return true
+}
+
+// ValidateTopicFilter verifies that a subscription topic filter meets MQTT specification:
+// - Non-empty
+// - No null character ('\u0000')
+// - Valid wildcard placements for '#' and '+'
+// - Supports $share/{group}/{topic}
+func ValidateTopicFilter(filter string) bool {
+	if len(filter) == 0 || strings.ContainsRune(filter, 0) {
+		return false
+	}
+	actualFilter := filter
+	if strings.HasPrefix(filter, "$share/") {
+		parts := strings.SplitN(filter, "/", 3)
+		if len(parts) < 3 || len(parts[1]) == 0 || strings.ContainsAny(parts[1], "+#") {
+			return false
+		}
+		actualFilter = parts[2]
+		if len(actualFilter) == 0 {
+			return false
+		}
+	}
+
+	levels := strings.Split(actualFilter, "/")
+	for i, level := range levels {
+		if level == "#" {
+			if i != len(levels)-1 {
+				return false // '#' must be the last topic level
+			}
+		} else if strings.Contains(level, "#") {
+			return false // '#' cannot be mixed with other characters in a level
+		} else if strings.Contains(level, "+") && level != "+" {
+			return false // '+' cannot be mixed with other characters in a level
+		}
+	}
+	return true
+}
 
 // Packet is the generic interface implemented by all MQTT packet types.
 type Packet interface {

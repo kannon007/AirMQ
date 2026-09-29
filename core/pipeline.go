@@ -26,9 +26,10 @@ type (
 
 // Pipeline error variables
 var (
-	ErrMessageDropped = pipeline.ErrMessageDropped
-	ErrAborted        = pipeline.ErrAborted
-	ErrUnauthorized   = pipeline.ErrUnauthorized
+	ErrMessageDropped    = pipeline.ErrMessageDropped
+	ErrAborted           = pipeline.ErrAborted
+	ErrUnauthorized      = pipeline.ErrUnauthorized
+	ErrProcessorPanicked = pipeline.ErrProcessorPanicked
 )
 
 // Constructors

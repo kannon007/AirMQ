@@ -1471,3 +1471,166 @@ func TestMQTT_TCP_StickyPackets_And_Fragmentation(t *testing.T) {
 	}
 }
 
+func TestMQTT50_SessionExpiryInterval_GC(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	expirySec := uint32(2)
+
+	// Step 1: Connect with CleanStart=true and SessionExpiryInterval=2s
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	sendPkt(t, c1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    true,
+		ClientID:      "session-gc-client",
+		Properties: &protocol.Properties{
+			SessionExpiryInterval: &expirySec,
+		},
+	})
+	ack1 := recvPkt(t, c1, protocol.V50).(*protocol.ConnackPacket)
+	if ack1.SessionPresent {
+		t.Fatalf("Expected SessionPresent=false on first connect")
+	}
+
+	// Step 2: Disconnect cleanly
+	sendPkt(t, c1, &protocol.DisconnectPacket{
+		ReasonCode: protocol.ReasonNormalDisconnection,
+	})
+	_ = c1.Close()
+
+	// Wait 200ms (well within the 2s expiry)
+	time.Sleep(200 * time.Millisecond)
+
+	// Step 3: Reconnect with CleanStart=false -> session MUST be present
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	sendPkt(t, c2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    false,
+		ClientID:      "session-gc-client",
+		Properties: &protocol.Properties{
+			SessionExpiryInterval: &expirySec,
+		},
+	})
+	ack2 := recvPkt(t, c2, protocol.V50).(*protocol.ConnackPacket)
+	if !ack2.SessionPresent {
+		t.Fatalf("Expected SessionPresent=true when reconnecting before expiry interval")
+	}
+
+	// Step 4: Disconnect again
+	sendPkt(t, c2, &protocol.DisconnectPacket{
+		ReasonCode: protocol.ReasonNormalDisconnection,
+	})
+	_ = c2.Close()
+
+	// Step 5: Wait > 2s + 1s ticker cycle for heartbeat GC to prune the session
+	time.Sleep(2500 * time.Millisecond)
+
+	// Step 6: Reconnect with CleanStart=false -> session MUST have been pruned (SessionPresent=false)
+	c3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer c3.Close()
+	sendPkt(t, c3, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanStart:    false,
+		ClientID:      "session-gc-client",
+	})
+	ack3 := recvPkt(t, c3, protocol.V50).(*protocol.ConnackPacket)
+	if ack3.SessionPresent {
+		t.Fatalf("Expected SessionPresent=false after session expiry interval exceeded")
+	}
+}
+
+func TestMQTT_Negative_MalformedPackets_Disconnect(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Client connects normally
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	sendPkt(t, conn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "malformed-client",
+	})
+	_ = recvPkt(t, conn, protocol.V311)
+
+	// 2. Client sends a PUBLISH with an illegal wildcard topic ("sensor/+/temp")
+	badPub := []byte{
+		0x30, 0x13, // PUBLISH QoS 0, remlen 19
+		0x00, 0x0D, 's', 'e', 'n', 's', 'o', 'r', '/', '+', '/', 't', 'e', 'm', 'p', // topic with '+'
+		'p', 'a', 'y', 'l',
+	}
+	_, _ = conn.Write(badPub)
+
+	// 3. Broker must close the connection on protocol violation
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 64)
+	n, readErr := conn.Read(buf)
+	if readErr == nil && n > 0 {
+		t.Fatalf("Expected connection to be closed by broker, but read %d bytes: %x", n, buf[:n])
+	}
+}
+
+func TestMQTT_RapidConnectDisconnect_Churn(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	var wg sync.WaitGroup
+	workers := 10
+	iterations := 15
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				clientID := fmt.Sprintf("churn-worker-%d-%d", workerID, i)
+				conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+				if err != nil {
+					t.Errorf("Dial failed: %v", err)
+					return
+				}
+
+				sendPkt(t, conn, &protocol.ConnectPacket{
+					ProtocolName:  "MQTT",
+					ProtocolLevel: protocol.V311,
+					CleanSession:  true,
+					ClientID:      clientID,
+				})
+				_ = recvPkt(t, conn, protocol.V311)
+
+				// Rapid ping
+				sendPkt(t, conn, &protocol.PingreqPacket{})
+				_ = recvPkt(t, conn, protocol.V311)
+
+				// Alternate between clean disconnect and abrupt socket drop
+				if i%2 == 0 {
+					sendPkt(t, conn, &protocol.DisconnectPacket{})
+				}
+				_ = conn.Close()
+			}
+		}(w)
+	}
+
+	wg.Wait()
+}
+
+
+
+

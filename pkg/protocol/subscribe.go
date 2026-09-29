@@ -117,6 +117,9 @@ func DecodeSubscribe(data []byte, protoLevel ...byte) (*SubscribePacket, error) 
 			return nil, ErrIncompletePacket
 		}
 		topic := string(data[offset : offset+topicLen])
+		if !ValidateTopicFilter(topic) {
+			return nil, ErrProtocolViolation
+		}
 		offset += topicLen
 
 		if offset >= len(data) {
@@ -306,9 +309,16 @@ func DecodeUnsubscribe(data []byte, protoLevel ...byte) (*UnsubscribePacket, err
 			return nil, ErrIncompletePacket
 		}
 		topic := string(data[offset : offset+topicLen])
+		if !ValidateTopicFilter(topic) {
+			return nil, ErrProtocolViolation
+		}
 		offset += topicLen
 
 		topics = append(topics, topic)
+	}
+
+	if len(topics) == 0 {
+		return nil, ErrEmptySubscription
 	}
 
 	return &UnsubscribePacket{

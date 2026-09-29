@@ -17,10 +17,13 @@ type Session struct {
 	Inflight      *InflightQueue
 	PacketIDs     *PacketIDAllocator
 	QoS2Inflight  map[uint16]*protocol.PublishPacket // Incoming QoS 2 packets awaiting PUBREL
-	ConnectedAt   time.Time
-	LastActiveAt  time.Time
-	Conn          any // Network connection handle (e.g., gnet.Conn)
-	WillPacket    *protocol.PublishPacket
+	ConnectedAt    time.Time
+	LastActiveAt   time.Time
+	DisconnectedAt time.Time
+	ExpiryInterval uint32
+	IsConnected    bool
+	Conn           any // Network connection handle (e.g., gnet.Conn)
+	WillPacket     *protocol.PublishPacket
 }
 
 // NewSession creates an active or clean session for a client.
@@ -34,6 +37,7 @@ func NewSession(clientID string, cleanSession bool) *Session {
 		QoS2Inflight:  make(map[uint16]*protocol.PublishPacket),
 		ConnectedAt:   time.Now(),
 		LastActiveAt:  time.Now(),
+		IsConnected:   true,
 	}
 }
 
@@ -86,6 +90,42 @@ func (s *Session) GetSubscriptions() map[string]byte {
 	return res
 }
 
+// SetConnected marks the session as actively connected.
+func (s *Session) SetConnected() {
+	s.mu.Lock()
+	s.IsConnected = true
+	s.DisconnectedAt = time.Time{}
+	s.mu.Unlock()
+}
+
+// SetDisconnected marks the session as disconnected with an expiry interval in seconds.
+func (s *Session) SetDisconnected(t time.Time, expiry uint32) {
+	s.mu.Lock()
+	s.IsConnected = false
+	s.DisconnectedAt = t
+	s.ExpiryInterval = expiry
+	s.mu.Unlock()
+}
+
+// IsExpired checks whether a disconnected session has expired according to its ExpiryInterval.
+func (s *Session) IsExpired(now time.Time) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.IsConnected {
+		return false
+	}
+	if s.ExpiryInterval == 0xFFFFFFFF {
+		return false
+	}
+	if s.ExpiryInterval == 0 {
+		return true
+	}
+	if s.DisconnectedAt.IsZero() {
+		return false
+	}
+	return now.Sub(s.DisconnectedAt) >= time.Duration(s.ExpiryInterval)*time.Second
+}
+
 // SessionManager manages active client sessions using 64 mutex shards
 // to eliminate global lock contention across thousands of concurrent clients.
 type SessionManager struct {
@@ -122,9 +162,11 @@ func (sm *SessionManager) GetOrSet(clientID string, cleanSession bool) (*Session
 	defer shard.mu.Unlock()
 
 	existing, exists := shard.sessions[clientID]
-	if exists && !cleanSession {
+	if exists && !cleanSession && !existing.IsExpired(time.Now()) {
 		existing.CleanSession = cleanSession
 		existing.LastActiveAt = time.Now()
+		existing.IsConnected = true
+		existing.DisconnectedAt = time.Time{}
 		return existing, true
 	}
 
@@ -148,6 +190,23 @@ func (sm *SessionManager) Delete(clientID string) {
 	shard.mu.Lock()
 	delete(shard.sessions, clientID)
 	shard.mu.Unlock()
+}
+
+// CleanExpiredSessions removes all expired disconnected sessions across all shards
+// and returns them so that subscriptions and associated storage state can be cleaned up.
+func (sm *SessionManager) CleanExpiredSessions(now time.Time) []*Session {
+	var expired []*Session
+	for _, shard := range sm.shards {
+		shard.mu.Lock()
+		for clientID, sess := range shard.sessions {
+			if sess.IsExpired(now) {
+				delete(shard.sessions, clientID)
+				expired = append(expired, sess)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return expired
 }
 
 // SubscriptionRecord represents an active subscription held by a client.

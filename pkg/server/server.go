@@ -183,6 +183,14 @@ func (s *Server) startHeartbeatLoop() {
 				}
 				return true
 			})
+
+			// Garbage collect expired MQTT sessions
+			expiredSessions := s.sessionMgr.CleanExpiredSessions(now)
+			for _, sess := range expiredSessions {
+				for topic := range sess.GetSubscriptions() {
+					s.router.Unsubscribe(topic, sess.ClientID)
+				}
+			}
 		}
 	}
 }
@@ -257,12 +265,27 @@ func (s *Server) closeClient(ctx *ConnContext, remoteAddr string, err error) {
 		ctx.WillTopic = "" // Prevent duplicate firing
 	}
 
-	// If session is CleanSession, purge subscriptions
-	if ctx.Session != nil && ctx.Session.CleanSession {
-		for topic := range ctx.Session.GetSubscriptions() {
-			s.router.Unsubscribe(topic, ctx.ClientID)
+	// MQTT session lifecycle handling on disconnect
+	if ctx.Session != nil {
+		if ctx.ProtocolLevel == protocol.V50 {
+			if ctx.SessionExpirySeconds == 0 {
+				for topic := range ctx.Session.GetSubscriptions() {
+					s.router.Unsubscribe(topic, ctx.ClientID)
+				}
+				s.sessionMgr.Delete(ctx.ClientID)
+			} else {
+				ctx.Session.SetDisconnected(time.Now(), ctx.SessionExpirySeconds)
+			}
+		} else {
+			if ctx.Session.CleanSession {
+				for topic := range ctx.Session.GetSubscriptions() {
+					s.router.Unsubscribe(topic, ctx.ClientID)
+				}
+				s.sessionMgr.Delete(ctx.ClientID)
+			} else {
+				ctx.Session.SetDisconnected(time.Now(), 0xFFFFFFFF)
+			}
 		}
-		s.sessionMgr.Delete(ctx.ClientID)
 	}
 }
 
@@ -491,8 +514,17 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 	ctx.Authed = true
 	ctx.KeepAlive = time.Duration(p.KeepAlive) * time.Second
 
+	if oldSess, ok := s.sessionMgr.Get(p.ClientID); ok {
+		if p.CleanSession || oldSess.IsExpired(time.Now()) {
+			for topic := range oldSess.GetSubscriptions() {
+				s.router.Unsubscribe(topic, p.ClientID)
+			}
+		}
+	}
+
 	sess, sessionPresent := s.sessionMgr.GetOrSet(p.ClientID, p.CleanSession)
 	ctx.Session = sess
+	sess.SetConnected()
 
 	// Evict existing connection with duplicate ClientID per MQTT spec
 	if oldVal, ok := s.conns.Load(p.ClientID); ok {
@@ -553,9 +585,9 @@ func (s *Server) handleConnect(c ClientConn, ctx *ConnContext, p *protocol.Conne
 }
 
 func (s *Server) handlePublish(c ClientConn, ctx *ConnContext, p *protocol.PublishPacket) gnet.Action {
-	// Topic validation: PUBLISH topic MUST NOT contain wildcards (+ or #)
-	if strings.ContainsAny(p.Topic, "+#") {
-		log.Printf("Client %s sent invalid PUBLISH topic containing wildcards: %s", ctx.ClientID, p.Topic)
+	// Topic validation: PUBLISH topic MUST NOT contain wildcards (+ or #), null bytes, or be empty
+	if !protocol.ValidatePublishTopic(p.Topic) {
+		log.Printf("Client %s sent invalid PUBLISH topic: %s", ctx.ClientID, p.Topic)
 		return gnet.Close
 	}
 
@@ -869,6 +901,9 @@ func (s *Server) handleAuth(c ClientConn, ctx *ConnContext, p *protocol.AuthPack
 func (s *Server) handleDisconnect(c ClientConn, ctx *ConnContext, p *protocol.DisconnectPacket) gnet.Action {
 	if p.ReasonCode != protocol.ReasonDisconnectWithWill {
 		ctx.CleanDisconnect = true
+	}
+	if p.Properties != nil && p.Properties.SessionExpiryInterval != nil {
+		ctx.SessionExpirySeconds = *p.Properties.SessionExpiryInterval
 	}
 	return gnet.Close
 }

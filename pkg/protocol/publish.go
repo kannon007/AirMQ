@@ -107,6 +107,9 @@ func DecodePublish(flags byte, data []byte, protoLevel ...byte) (*PublishPacket,
 	}
 
 	topic := string(data[offset : offset+topicLen])
+	if !ValidatePublishTopic(topic) {
+		return nil, ErrProtocolViolation
+	}
 	offset += topicLen
 
 	var packetID uint16

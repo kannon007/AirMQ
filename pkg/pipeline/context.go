@@ -7,9 +7,10 @@ import (
 )
 
 var (
-	ErrMessageDropped = errors.New("pipeline: message dropped")
-	ErrAborted        = errors.New("pipeline: processing aborted")
-	ErrUnauthorized   = errors.New("pipeline: unauthorized client")
+	ErrMessageDropped    = errors.New("pipeline: message dropped")
+	ErrAborted           = errors.New("pipeline: processing aborted")
+	ErrUnauthorized      = errors.New("pipeline: unauthorized client")
+	ErrProcessorPanicked = errors.New("pipeline: processor panicked")
 )
 
 // Context represents the execution context of a message passing through a pipeline of Processors.

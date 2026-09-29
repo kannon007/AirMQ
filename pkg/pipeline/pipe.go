@@ -159,7 +159,16 @@ func (p *Pipe) Process(c *Context) error {
 			start = time.Now()
 		}
 
-		err := rp.processor.Process(c)
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("%w: processor %q panicked: %v", ErrProcessorPanicked, rp.name, r)
+					c.Drop(fmt.Sprintf("processor %s panic: %v", rp.name, r))
+				}
+			}()
+			err = rp.processor.Process(c)
+		}()
 
 		// 3. Record performance metrics
 		if sampled {
