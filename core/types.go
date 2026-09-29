@@ -11,6 +11,13 @@ import (
 // Hook and security type aliases
 type Hook = hook.Hook
 type BaseHook = hook.BaseHook
+type NoopHook = hook.NoopHook
+type ConnectHook = hook.ConnectHook
+type AuthorizeHook = hook.AuthorizeHook
+type PublishHook = hook.PublishHook
+type DeliveredHook = hook.DeliveredHook
+type DisconnectHook = hook.DisconnectHook
+type FullHook = hook.FullHook
 type ClientContext = hook.ClientContext
 type AuthAction = hook.AuthAction
 type HookManager = hook.Manager

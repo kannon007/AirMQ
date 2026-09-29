@@ -1018,3 +1018,312 @@ func TestMQTT_Publish_TopicWildcard_Rejected(t *testing.T) {
 		t.Fatalf("Expected connection to be closed after invalid topic publish")
 	}
 }
+
+func TestMQTT311_LastWillAndTestament_CleanDisconnect(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	subConn, _ := net.Dial("tcp", addr)
+	defer subConn.Close()
+	sendPkt(t, subConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "sub-lwt-clean",
+	})
+	_ = recvPkt(t, subConn, protocol.V311)
+
+	sendPkt(t, subConn, &protocol.SubscribePacket{
+		PacketID: 41,
+		Topics:   []protocol.TopicSub{{Topic: "devices/clean/status", QoS: 0}},
+	})
+	_ = recvPkt(t, subConn, protocol.V311)
+
+	lwtConn, _ := net.Dial("tcp", addr)
+	defer lwtConn.Close()
+	sendPkt(t, lwtConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "client-clean-disconnect",
+		WillFlag:      true,
+		WillTopic:     "devices/clean/status",
+		WillMessage:   []byte("unexpected-offline"),
+		WillQoS:       0,
+	})
+	_ = recvPkt(t, lwtConn, protocol.V311)
+
+	// Send clean DISCONNECT
+	sendPkt(t, lwtConn, &protocol.DisconnectPacket{})
+	time.Sleep(100 * time.Millisecond)
+
+	// Subscriber must NEVER receive the will message
+	assertNoIncoming(t, subConn, 200*time.Millisecond)
+}
+
+func TestMQTT50_SharedSubscription_RoundRobin(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	// Worker 1
+	connW1, _ := net.Dial("tcp", addr)
+	defer connW1.Close()
+	sendPkt(t, connW1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "worker-1",
+	})
+	_ = recvPkt(t, connW1, protocol.V50)
+	sendPkt(t, connW1, &protocol.SubscribePacket{
+		ProtocolLevel: protocol.V50,
+		PacketID:      1,
+		Topics:        []protocol.TopicSub{{Topic: "$share/jobs/tasks/+", QoS: 0}},
+	})
+	_ = recvPkt(t, connW1, protocol.V50)
+
+	// Worker 2
+	connW2, _ := net.Dial("tcp", addr)
+	defer connW2.Close()
+	sendPkt(t, connW2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "worker-2",
+	})
+	_ = recvPkt(t, connW2, protocol.V50)
+	sendPkt(t, connW2, &protocol.SubscribePacket{
+		ProtocolLevel: protocol.V50,
+		PacketID:      2,
+		Topics:        []protocol.TopicSub{{Topic: "$share/jobs/tasks/+", QoS: 0}},
+	})
+	_ = recvPkt(t, connW2, protocol.V50)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Publisher
+	pubConn, _ := net.Dial("tcp", addr)
+	defer pubConn.Close()
+	sendPkt(t, pubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "producer",
+	})
+	_ = recvPkt(t, pubConn, protocol.V50)
+
+	totalJobs := 10
+	for i := 1; i <= totalJobs; i++ {
+		sendPkt(t, pubConn, &protocol.PublishPacket{
+			ProtocolLevel: protocol.V50,
+			Topic:         fmt.Sprintf("tasks/%d", i),
+			Payload:       []byte(fmt.Sprintf("job-%d", i)),
+			QoS:           0,
+		})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	w1Count := 0
+	w2Count := 0
+
+	for {
+		_ = connW1.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		val, _ := connBufMap.LoadOrStore(connW1, new(bytes.Buffer))
+		buf := val.(*bytes.Buffer)
+		if buf.Len() >= 2 {
+			if pkt, consumed, err := protocol.DecodePacket(buf.Bytes(), protocol.V50); err == nil && pkt != nil {
+				buf.Next(consumed)
+				if _, ok := pkt.(*protocol.PublishPacket); ok {
+					w1Count++
+					continue
+				}
+			}
+		}
+		tmp := make([]byte, 1024)
+		n, err := connW1.Read(tmp)
+		if err != nil || n == 0 {
+			break
+		}
+		buf.Write(tmp[:n])
+		if pkt, consumed, err := protocol.DecodePacket(buf.Bytes(), protocol.V50); err == nil && pkt != nil {
+			buf.Next(consumed)
+			if _, ok := pkt.(*protocol.PublishPacket); ok {
+				w1Count++
+			}
+		}
+	}
+
+	for {
+		_ = connW2.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		val, _ := connBufMap.LoadOrStore(connW2, new(bytes.Buffer))
+		buf := val.(*bytes.Buffer)
+		if buf.Len() >= 2 {
+			if pkt, consumed, err := protocol.DecodePacket(buf.Bytes(), protocol.V50); err == nil && pkt != nil {
+				buf.Next(consumed)
+				if _, ok := pkt.(*protocol.PublishPacket); ok {
+					w2Count++
+					continue
+				}
+			}
+		}
+		tmp := make([]byte, 1024)
+		n, err := connW2.Read(tmp)
+		if err != nil || n == 0 {
+			break
+		}
+		buf.Write(tmp[:n])
+		if pkt, consumed, err := protocol.DecodePacket(buf.Bytes(), protocol.V50); err == nil && pkt != nil {
+			buf.Next(consumed)
+			if _, ok := pkt.(*protocol.PublishPacket); ok {
+				w2Count++
+			}
+		}
+	}
+
+	if w1Count+w2Count != totalJobs {
+		t.Fatalf("Expected total %d jobs processed across workers, got w1=%d, w2=%d (sum=%d)", totalJobs, w1Count, w2Count, w1Count+w2Count)
+	}
+	if w1Count == 0 || w2Count == 0 {
+		t.Fatalf("Expected load balancing between workers, but w1=%d, w2=%d", w1Count, w2Count)
+	}
+}
+
+func TestMQTT50_RetainAsPublished_Option(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	// Sub 1: RetainAsPublished = true
+	conn1, _ := net.Dial("tcp", addr)
+	defer conn1.Close()
+	sendPkt(t, conn1, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "sub-rap-true",
+	})
+	_ = recvPkt(t, conn1, protocol.V50)
+	sendPkt(t, conn1, &protocol.SubscribePacket{
+		ProtocolLevel: protocol.V50,
+		PacketID:      1,
+		Topics: []protocol.TopicSub{
+			{Topic: "telemetry/rap", QoS: 0, RetainAsPublished: true},
+		},
+	})
+	_ = recvPkt(t, conn1, protocol.V50)
+
+	// Sub 2: RetainAsPublished = false (default)
+	conn2, _ := net.Dial("tcp", addr)
+	defer conn2.Close()
+	sendPkt(t, conn2, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "sub-rap-false",
+	})
+	_ = recvPkt(t, conn2, protocol.V50)
+	sendPkt(t, conn2, &protocol.SubscribePacket{
+		ProtocolLevel: protocol.V50,
+		PacketID:      2,
+		Topics: []protocol.TopicSub{
+			{Topic: "telemetry/rap", QoS: 0, RetainAsPublished: false},
+		},
+	})
+	_ = recvPkt(t, conn2, protocol.V50)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Publisher sends message with Retain = true
+	pubConn, _ := net.Dial("tcp", addr)
+	defer pubConn.Close()
+	sendPkt(t, pubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V50,
+		CleanSession:  true,
+		ClientID:      "rap-publisher",
+	})
+	_ = recvPkt(t, pubConn, protocol.V50)
+
+	sendPkt(t, pubConn, &protocol.PublishPacket{
+		ProtocolLevel: protocol.V50,
+		Topic:         "telemetry/rap",
+		Payload:       []byte("state-v1"),
+		QoS:           0,
+		Retain:        true,
+	})
+
+	// Sub 1 should preserve Retain == true
+	p1 := recvPkt(t, conn1, protocol.V50).(*protocol.PublishPacket)
+	if !p1.Retain {
+		t.Fatalf("Expected Sub1 to preserve Retain=true under RetainAsPublished, got retain=%v", p1.Retain)
+	}
+
+	// Sub 2 should receive Retain == false
+	p2 := recvPkt(t, conn2, protocol.V50).(*protocol.PublishPacket)
+	if p2.Retain {
+		t.Fatalf("Expected Sub2 to receive Retain=false without RetainAsPublished, got retain=%v", p2.Retain)
+	}
+}
+
+func TestMQTT_Unsubscribe_Flow(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	subConn, _ := net.Dial("tcp", addr)
+	defer subConn.Close()
+	sendPkt(t, subConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "sub-unsub",
+	})
+	_ = recvPkt(t, subConn, protocol.V311)
+
+	// Subscribe
+	sendPkt(t, subConn, &protocol.SubscribePacket{
+		PacketID: 10,
+		Topics:   []protocol.TopicSub{{Topic: "test/unsub", QoS: 0}},
+	})
+	_ = recvPkt(t, subConn, protocol.V311) // SUBACK
+
+	// Publish 1: sub should receive
+	pubConn, _ := net.Dial("tcp", addr)
+	defer pubConn.Close()
+	sendPkt(t, pubConn, &protocol.ConnectPacket{
+		ProtocolName:  "MQTT",
+		ProtocolLevel: protocol.V311,
+		CleanSession:  true,
+		ClientID:      "pub-unsub",
+	})
+	_ = recvPkt(t, pubConn, protocol.V311)
+
+	sendPkt(t, pubConn, &protocol.PublishPacket{
+		Topic:   "test/unsub",
+		Payload: []byte("msg1"),
+		QoS:     0,
+	})
+
+	p1 := recvPkt(t, subConn, protocol.V311).(*protocol.PublishPacket)
+	if string(p1.Payload) != "msg1" {
+		t.Fatalf("Expected msg1, got: %s", string(p1.Payload))
+	}
+
+	// Unsubscribe
+	sendPkt(t, subConn, &protocol.UnsubscribePacket{
+		PacketID: 11,
+		Topics:   []string{"test/unsub"},
+	})
+	unsuback := recvPkt(t, subConn, protocol.V311).(*protocol.UnsubackPacket)
+	if unsuback.PacketID != 11 {
+		t.Fatalf("Expected UNSUBACK with PacketID 11, got: %d", unsuback.PacketID)
+	}
+
+	// Publish 2: sub should NOT receive
+	sendPkt(t, pubConn, &protocol.PublishPacket{
+		Topic:   "test/unsub",
+		Payload: []byte("msg2"),
+		QoS:     0,
+	})
+
+	assertNoIncoming(t, subConn, 200*time.Millisecond)
+}

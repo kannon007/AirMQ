@@ -32,29 +32,65 @@ func NewClientContext(clientID, username, remoteAddr string) *ClientContext {
 	}
 }
 
-// Hook defines the pluggable lifecycle interface.
-// Plugins implement only the methods they care about.
+// Hook defines the pluggable lifecycle interface marker.
+// Plugins implement only the sub-interfaces they care about (ConnectHook, AuthorizeHook, PublishHook, etc.).
 type Hook interface {
 	Name() string
+}
+
+// ConnectHook handles client authentication and connection lifecycle.
+type ConnectHook interface {
 	OnConnect(ctx *ClientContext, pkt *protocol.ConnectPacket) (bool, byte, error)
+}
+
+// AuthorizeHook performs granular ACL checks on topic subscribe and publish actions.
+type AuthorizeHook interface {
 	OnAuthorize(ctx *ClientContext, action AuthAction, topic string) (bool, error)
+}
+
+// PublishHook inspects, mutates, or filters incoming publish messages.
+type PublishHook interface {
 	OnPublish(ctx *ClientContext, pkt *protocol.PublishPacket) (bool, error)
+}
+
+// DeliveredHook is notified after a publish packet has been dispatched to a subscriber.
+type DeliveredHook interface {
 	OnDelivered(ctx *ClientContext, pkt *protocol.PublishPacket)
+}
+
+// DisconnectHook handles client disconnection events.
+type DisconnectHook interface {
 	OnDisconnect(ctx *ClientContext, err error)
 }
 
-// BaseHook provides default no-op implementations for convenient embedding.
+// FullHook aggregates all hook interfaces for backward compatibility or monolithic plugins.
+type FullHook interface {
+	Hook
+	ConnectHook
+	AuthorizeHook
+	PublishHook
+	DeliveredHook
+	DisconnectHook
+}
+
+// BaseHook provides default no-op implementation of Name for convenient embedding.
 type BaseHook struct{}
 
 func (b *BaseHook) Name() string { return "BaseHook" }
-func (b *BaseHook) OnConnect(ctx *ClientContext, pkt *protocol.ConnectPacket) (bool, byte, error) {
+
+// NoopHook provides no-op implementations of all hook methods if a monolithic stub is needed.
+type NoopHook struct {
+	BaseHook
+}
+
+func (n *NoopHook) OnConnect(ctx *ClientContext, pkt *protocol.ConnectPacket) (bool, byte, error) {
 	return true, 0, nil
 }
-func (b *BaseHook) OnAuthorize(ctx *ClientContext, action AuthAction, topic string) (bool, error) {
+func (n *NoopHook) OnAuthorize(ctx *ClientContext, action AuthAction, topic string) (bool, error) {
 	return true, nil
 }
-func (b *BaseHook) OnPublish(ctx *ClientContext, pkt *protocol.PublishPacket) (bool, error) {
+func (n *NoopHook) OnPublish(ctx *ClientContext, pkt *protocol.PublishPacket) (bool, error) {
 	return false, nil // don't drop
 }
-func (b *BaseHook) OnDelivered(ctx *ClientContext, pkt *protocol.PublishPacket) {}
-func (b *BaseHook) OnDisconnect(ctx *ClientContext, err error)                  {}
+func (n *NoopHook) OnDelivered(ctx *ClientContext, pkt *protocol.PublishPacket) {}
+func (n *NoopHook) OnDisconnect(ctx *ClientContext, err error)                  {}

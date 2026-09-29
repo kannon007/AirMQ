@@ -289,7 +289,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			qos := (flags >> 1) & 0x03
 			retain := (flags & 0x01) != 0
 
-			if qos == protocol.QoS0 && !retain && !s.hookMgr.HasPublishHooks() && s.clusterRouter == nil && ctx.ProtocolLevel != protocol.V50 {
+			if qos == protocol.QoS0 && !retain && !s.hookMgr.HasPublishHooks() && !s.hookMgr.HasAuthorizeHooks() && s.clusterRouter == nil && ctx.ProtocolLevel != protocol.V50 {
 				remLen, varByteLen, err := protocol.DecodeRemainingLength(buf[offset+1:])
 				if err == nil && varByteLen > 0 {
 					totalLen := 1 + varByteLen + remLen
@@ -576,7 +576,30 @@ func (s *Server) handlePublish(c ClientConn, ctx *ConnContext, p *protocol.Publi
 	s.metrics.IncMsgReceived(p.QoS)
 	s.metrics.AddBytesReceived(len(p.Payload))
 
-	if s.hookMgr.HasHooks() {
+	if s.hookMgr != nil && s.hookMgr.HasAuthorizeHooks() {
+		hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
+		allow, err := s.hookMgr.FireAuthorize(hookCtx, hook.AuthActionPublish, p.Topic)
+		if err != nil || !allow {
+			if p.QoS == protocol.QoS1 && ctx.ProtocolLevel == protocol.V50 {
+				puback := &protocol.PubackPacket{
+					PacketID:   p.PacketID,
+					ReasonCode: protocol.ReasonNotAuthorized,
+				}
+				data, _ := puback.Encode()
+				_, _ = c.Write(data)
+			} else if p.QoS == protocol.QoS2 && ctx.ProtocolLevel == protocol.V50 {
+				pubrec := &protocol.PubrecPacket{
+					PacketID:   p.PacketID,
+					ReasonCode: protocol.ReasonNotAuthorized,
+				}
+				data, _ := pubrec.Encode()
+				_, _ = c.Write(data)
+			}
+			return gnet.None
+		}
+	}
+
+	if s.hookMgr != nil && s.hookMgr.HasPublishHooks() {
 		hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
 		drop, err := s.hookMgr.FirePublish(hookCtx, p)
 		if err != nil || drop {
@@ -667,10 +690,10 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 		return
 	}
 
-	var qos0BytesV3 []byte
-	var qos0V3Encoded bool
-	var qos0BytesV5 []byte
-	var qos0V5Encoded bool
+	var qos0BytesV3 [2][]byte
+	var qos0V3Encoded [2]bool
+	var qos0BytesV5 [2][]byte
+	var qos0V5Encoded [2]bool
 
 	for _, sub := range subscribers {
 		// MQTT 5.0 NoLocal: sender should not receive own message
@@ -729,25 +752,37 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 		}
 
 		if grantedQoS == protocol.QoS0 {
+			rIdx := 0
+			if retainFlag {
+				rIdx = 1
+			}
 			var wireBytes []byte
 			if clientProto == protocol.V50 {
-				if !qos0V5Encoded {
+				if !qos0V5Encoded[rIdx] {
 					outPub.PacketID = 0
-					qos0BytesV5, _ = outPub.Encode()
-					qos0V5Encoded = true
+					qos0BytesV5[rIdx], _ = outPub.Encode()
+					qos0V5Encoded[rIdx] = true
 				}
-				wireBytes = qos0BytesV5
+				wireBytes = qos0BytesV5[rIdx]
 			} else {
-				if !qos0V3Encoded {
+				if !qos0V3Encoded[rIdx] {
 					outPub.PacketID = 0
-					qos0BytesV3, _ = outPub.Encode()
-					qos0V3Encoded = true
+					qos0BytesV3[rIdx], _ = outPub.Encode()
+					qos0V3Encoded[rIdx] = true
 				}
-				wireBytes = qos0BytesV3
+				wireBytes = qos0BytesV3[rIdx]
 			}
 			_, _ = entry.conn.Write(wireBytes)
 			s.metrics.IncMsgSent(0)
 			s.metrics.AddBytesSent(len(p.Payload))
+			if s.hookMgr != nil {
+				var remoteAddr string
+				if entry.conn != nil && entry.conn.RemoteAddr() != nil {
+					remoteAddr = entry.conn.RemoteAddr().String()
+				}
+				hookCtx := hook.NewClientContext(sub.ClientID, "", remoteAddr)
+				s.hookMgr.FireDelivered(hookCtx, outPub)
+			}
 		} else {
 			if sess, ok := s.sessionMgr.Get(sub.ClientID); ok && sess != nil {
 				if pid, err := sess.PacketIDs.Allocate(); err == nil {
@@ -764,6 +799,14 @@ func (s *Server) dispatchPublish(p *protocol.PublishPacket, senderClientID strin
 				_, _ = entry.conn.Write(encoded)
 				s.metrics.IncMsgSent(grantedQoS)
 				s.metrics.AddBytesSent(len(p.Payload))
+				if s.hookMgr != nil {
+					var remoteAddr string
+					if entry.conn != nil && entry.conn.RemoteAddr() != nil {
+						remoteAddr = entry.conn.RemoteAddr().String()
+					}
+					hookCtx := hook.NewClientContext(sub.ClientID, "", remoteAddr)
+					s.hookMgr.FireDelivered(hookCtx, outPub)
+				}
 			}
 		}
 	}
@@ -836,6 +879,19 @@ func (s *Server) handleSubscribe(c ClientConn, ctx *ConnContext, p *protocol.Sub
 	var retainedToSend []*protocol.PublishPacket
 
 	for i, sub := range p.Topics {
+		if s.hookMgr != nil && s.hookMgr.HasAuthorizeHooks() {
+			hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
+			allowed, err := s.hookMgr.FireAuthorize(hookCtx, hook.AuthActionSubscribe, sub.Topic)
+			if err != nil || !allowed {
+				if ctx.ProtocolLevel == protocol.V50 {
+					retCodes[i] = protocol.ReasonNotAuthorized
+				} else {
+					retCodes[i] = 0x80
+				}
+				continue
+			}
+		}
+
 		isNewSub := true
 		if ctx.Session != nil {
 			subs := ctx.Session.GetSubscriptions()
@@ -886,6 +942,28 @@ func (s *Server) handleSubscribe(c ClientConn, ctx *ConnContext, p *protocol.Sub
 		if shouldSendRetained && len(allRetained) > 0 {
 			for _, rMsg := range allRetained {
 				if trie.TopicFilterMatches(sub.Topic, rMsg.Topic) {
+					if s.hookMgr != nil && s.hookMgr.HasAuthorizeHooks() {
+						hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
+						allowed, err := s.hookMgr.FireAuthorize(hookCtx, hook.AuthActionSubscribe, rMsg.Topic)
+						if err != nil || !allowed {
+							continue
+						}
+					}
+					if s.hookMgr != nil && s.hookMgr.HasPublishHooks() {
+						hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
+						rPub := &protocol.PublishPacket{
+							ProtocolLevel: ctx.ProtocolLevel,
+							Topic:         rMsg.Topic,
+							Payload:       rMsg.Payload,
+							QoS:           rMsg.QoS,
+							Retain:        true,
+							Properties:    rMsg.Properties,
+						}
+						drop, err := s.hookMgr.FirePublish(hookCtx, rPub)
+						if err != nil || drop {
+							continue
+						}
+					}
 					grantedQoS := rMsg.QoS
 					if sub.QoS < grantedQoS {
 						grantedQoS = sub.QoS
@@ -921,6 +999,10 @@ func (s *Server) handleSubscribe(c ClientConn, ctx *ConnContext, p *protocol.Sub
 	for _, outPub := range retainedToSend {
 		if enc, err := outPub.Encode(); err == nil {
 			_, _ = c.Write(enc)
+			if s.hookMgr != nil {
+				hookCtx := hook.NewClientContext(ctx.ClientID, ctx.Username, c.RemoteAddr().String())
+				s.hookMgr.FireDelivered(hookCtx, outPub)
+			}
 		}
 	}
 

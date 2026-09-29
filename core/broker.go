@@ -36,6 +36,10 @@ func NewBroker(opts ...Option) (*Broker, error) {
 		opt(cfg)
 	}
 
+	if cfg.initErr != nil {
+		return nil, cfg.initErr
+	}
+
 	tcpAddr := cfg.tcpAddr
 	if tcpAddr != "" && !strings.Contains(tcpAddr, "://") {
 		tcpAddr = "tcp://" + tcpAddr

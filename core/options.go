@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"time"
 
 	"mqtt/pkg/hook"
@@ -9,6 +10,7 @@ import (
 )
 
 type brokerConfig struct {
+	initErr          error
 	tcpAddr          string
 	multicore        bool
 	reusePort        bool
@@ -106,20 +108,30 @@ func WithMemoryStore() Option {
 // WithPebbleStore initializes high-performance Pebble LSM-Tree storage.
 func WithPebbleStore(dataDir string) Option {
 	return func(c *brokerConfig) {
-		ps, err := store.NewPebbleStore(dataDir)
-		if err == nil {
-			c.store = ps
+		if c.initErr != nil {
+			return
 		}
+		ps, err := store.NewPebbleStore(dataDir)
+		if err != nil {
+			c.initErr = fmt.Errorf("failed to initialize pebble store at %q: %w", dataDir, err)
+			return
+		}
+		c.store = ps
 	}
 }
 
 // WithBadgerStore initializes BadgerDB key-value storage.
 func WithBadgerStore(dataDir string) Option {
 	return func(c *brokerConfig) {
-		bs, err := store.NewBadgerStore(dataDir)
-		if err == nil {
-			c.store = bs
+		if c.initErr != nil {
+			return
 		}
+		bs, err := store.NewBadgerStore(dataDir)
+		if err != nil {
+			c.initErr = fmt.Errorf("failed to initialize badger store at %q: %w", dataDir, err)
+			return
+		}
+		c.store = bs
 	}
 }
 
